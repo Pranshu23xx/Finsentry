@@ -1,0 +1,24 @@
+{
+  "logging": {
+    "retentionDays": 180,
+    "retentionConfigurable": true,
+    "retentionAuditable": true,
+    "authEventLogging": true
+  },
+  "authentication": {
+    "maxFailedAttempts": 5,
+    "lockoutWindowMinutes": 15,
+    "lockoutEnabled": true,
+    "stepUpAuthEnabled": true
+  },
+  "payments": {
+    "auditTrailEnabled": true,
+    "tamperEvidenceEnabled": true
+  },
+  "dataProtection": {
+    "maskEnabled": true,
+    "tokenizeEnabled": false,
+    "encryptEnabled": true,
+    "plaintextLoggingBlocked": true
+  }
+}

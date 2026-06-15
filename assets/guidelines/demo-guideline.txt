@@ -1,0 +1,16 @@
+FinSentry Demo RBI-Style Guideline
+
+1. Customer Authentication Event Logging
+All customer authentication events must be logged. Logs must include the customer identifier, channel, timestamp, outcome, and risk signals. Authentication logs must be retained for at least 180 days and the retention period must be configurable and auditable.
+
+2. Failed Login Monitoring
+Applications must detect repeated failed login attempts. After five failed attempts within fifteen minutes, the system must trigger a risk event, record an audit entry, and apply an appropriate lockout or step-up authentication policy.
+
+3. Payment Transaction Audit Trail
+Every payment transaction must have a tamper-evident audit trail. The audit record must include transaction id, customer id, amount, beneficiary, approval state, actor, timestamp, and system decision reason.
+
+4. Sensitive Data Protection
+Customer personal information and account numbers must not be written to plaintext logs. Sensitive values must be masked, tokenized, or encrypted before they are persisted in logs, traces, or operational events.
+
+5. Compliance Evidence
+Systems implementing these controls must expose evidence that logging, retention, masking, lockout, and audit workflows are configured and active. Evidence may include configuration files, tests, migration scripts, policy code, or service handlers.

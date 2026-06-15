@@ -1,0 +1,28 @@
+{
+  "name": "finsentry",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Local-first agentic compliance intelligence for turning regulatory documents into verifiable engineering compliance.",
+  "scripts": {
+    "finsentry": "bun src/main.ts",
+    "setup": "bun src/main.ts setup",
+    "ingest": "bun src/main.ts ingest",
+    "scan": "bun src/main.ts scan",
+    "validate": "bun src/main.ts validate",
+    "mcp": "bun src/main.ts mcp",
+    "status": "bun src/main.ts status",
+    "demo:pdf": "bun scripts/create-demo-pdf.ts",
+    "check": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.9.0",
+    "@opentui/core": "^0.4.1",
+    "openai": "^6.42.0",
+    "pdf-parse": "^2.4.5"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.1",
+    "typescript": "^5.9.3"
+  }
+}
