@@ -1,35 +1,46 @@
-import { createCliRenderer, Box, Text, TabSelect, ScrollBox, TextAttributes, t, bold, fg } from "@opentui/core"
+import { Box, ScrollBox, TabSelect, Text, TextAttributes, bold, createCliRenderer, fg, t } from "@opentui/core"
 import { getSetupState } from "./setup"
-import { getMaps, getLatestScan, getScanResults, getValidations } from "./db"
-import type { SetupState, MAP, Scan, Validation } from "./types"
+import { getDb, getDocuments, getLatestScan, getMaps, getScanResults, getValidations } from "./db"
+import { COMMANDS, getCommandHelp, parseSlashCommand, runOfflineCommand } from "./commands"
+import type { Document, MAP, Scan, Validation } from "./types"
 
-type ScreenName = "dashboard" | "setup" | "maps" | "scan" | "validate" | "mcp"
+type ScreenName = "dashboard" | "regulations" | "requirements" | "scan" | "validate" | "about"
 
-const SCREEN_NAMES: ScreenName[] = ["dashboard", "setup", "maps", "scan", "validate", "mcp"]
+const SCREEN_NAMES: ScreenName[] = ["dashboard", "regulations", "requirements", "scan", "validate", "about"]
+
+const CANARA_BLUE = "#003366"
+const CANARA_SAFFRON = "#FF9933"
+const GOOD = "#2E7D32"
+const BAD = "#C62828"
+const WARN = "#F9A825"
+const MUTED = "#8EA4B8"
 
 interface AppState {
   selectedIndex: number
-  setupState: SetupState | null
+}
+
+interface RegulationSummary {
+  id: string
+  name: string
+  category: string
+  fetchedAt: string
+  pageCount: number
+  source: "regulation" | "document"
 }
 
 export async function launchTui(): Promise<void> {
   const state: AppState = {
     selectedIndex: 0,
-    setupState: null,
   }
 
-  try {
-    state.setupState = getSetupState()
-  } catch { }
-
   const renderer = await createCliRenderer({ exitOnCtrlC: true })
-
   let currentApp: any = null
 
   function render(): void {
     if (currentApp !== null) {
       renderer.root.remove(currentApp)
     }
+
     currentApp = buildApp(state, render)
     renderer.root.add(currentApp)
   }
@@ -38,253 +49,368 @@ export async function launchTui(): Promise<void> {
 }
 
 function buildApp(state: AppState, reRender: () => void): any {
-  const header = Box(
-    { borderStyle: "rounded", padding: 1, gap: 1 },
-    Text({
-      content: t`${bold(" FinSentry - Compliance Intelligence ")}`,
-      fg: "#00AAFF",
-    }),
-    Text({
-      content: " Local-first regulatory compliance for engineering teams ",
-      fg: "#888888",
-    })
-  )
-
   const tabs = TabSelect({
-    width: 80,
-    tabWidth: 14,
+    width: 96,
+    tabWidth: 16,
     options: [
-      { name: "Dashboard", description: "Overview" },
-      { name: "Setup", description: "Install status" },
-      { name: "MAPs", description: "Action points" },
-      { name: "Scan", description: "Repo scan results" },
-      { name: "Validate", description: "Compliance check" },
-      { name: "MCP", description: "Server info" },
+      { name: "Dashboard", description: "Stats" },
+      { name: "Regulations", description: "RBI docs" },
+      { name: "Requirements", description: "Controls" },
+      { name: "Scan", description: "History" },
+      { name: "Validate", description: "Proof" },
+      { name: "About", description: "Canara" },
     ],
-  })
-
-  tabs.on("itemSelected", (_index: number, _option: { name: string }) => {
-    // handled by selectionChanged
   })
 
   tabs.on("selectionChanged", (index: number) => {
     state.selectedIndex = index
     reRender()
   })
-
   tabs.focus()
 
-  const content = buildScreen(state, SCREEN_NAMES[state.selectedIndex] ?? "dashboard")
-
-  const footer = Box(
-    { borderStyle: "single", padding: 1 },
-    Text({
-      content: t`${fg("#666666")(" Ctrl+C to exit | ← → navigate | Enter to select ")}`,
-    })
-  )
+  const screen = SCREEN_NAMES[state.selectedIndex] ?? "dashboard"
 
   return Box(
     { flexDirection: "column", padding: 1, gap: 1, height: "100%" },
-    header,
-    Box({ padding: 1 }, tabs),
-    content,
-    footer
+    header(),
+    Box({ padding: 1, borderStyle: "single", borderColor: CANARA_BLUE }, tabs),
+    buildScreen(screen),
+    footer(screen)
   )
 }
 
-function buildScreen(state: AppState, screen: ScreenName): any {
+function header(): any {
+  return Box(
+    { flexDirection: "column", borderStyle: "double", borderColor: CANARA_BLUE, padding: 1, gap: 0 },
+    Text({ content: t`${fg(CANARA_SAFFRON)(bold(" CANARA BANK  "))}${fg("#FFFFFF")(bold("FinSentry"))}` }),
+    Text({
+      content: " Programmatic RBI compliance proof for banking engineering teams ",
+      fg: MUTED,
+    }),
+    Text({
+      content: " Offline agent ready | RBI mandates -> requirements -> scans -> validation evidence ",
+      fg: CANARA_SAFFRON,
+    })
+  )
+}
+
+function footer(screen: ScreenName): any {
+  const command = parseSlashCommand(screen === "about" ? "/about" : "/status")
+  const preview = runOfflineCommand(command)
+
+  return Box(
+    { borderStyle: "single", borderColor: CANARA_BLUE, padding: 1 },
+    Text({
+      content: ` Ctrl+C exit | arrows switch tabs | ${getCommandHelp()} | offline: ${preview.title}`,
+      fg: MUTED,
+    })
+  )
+}
+
+function buildScreen(screen: ScreenName): any {
   switch (screen) {
-    case "setup":
-      return setupScreen(state)
     case "dashboard":
       return dashboardScreen()
-    case "maps":
-      return mapsScreen()
+    case "regulations":
+      return regulationsScreen()
+    case "requirements":
+      return requirementsScreen()
     case "scan":
       return scanScreen()
     case "validate":
       return validateScreen()
-    case "mcp":
-      return mcpScreen()
+    case "about":
+      return aboutScreen()
   }
-}
-
-function setupScreen(state: AppState): any {
-  const s = state.setupState
-  if (!s) {
-    return Box(
-      { borderStyle: "rounded", padding: 1, flexGrow: 1 },
-      Text({ content: " Could not read setup state. Run: bun run finsentry setup ", fg: "#888888" })
-    )
-  }
-
-  const items = [
-    `Database          ${s.db_initialized ? "✓" : "○"}`,
-    `Ollama Installed  ${s.ollama_installed ? "✓" : "○"}`,
-    `Ollama Running    ${s.ollama_running ? "✓" : "○"}`,
-    `Model Pulled      ${s.model_pulled ? "✓" : "○"}`,
-    `Guideline Seeded  ${s.seeded ? "✓" : "○"}`,
-    `MAPs Extracted    ${s.maps_extracted ? "✓" : "○"}`,
-    `Setup Complete    ${s.completed ? "✓" : "○"}`,
-  ]
-
-  return Box(
-    { flexDirection: "column", borderStyle: "rounded", padding: 1, gap: 1, flexGrow: 1 },
-    Text({ content: t`${fg("#FFFF00")(" Setup Status ")}` }),
-    Box({ flexDirection: "column", gap: 0 }, ...items.map((i) => Text({ content: `  ${i}` }))),
-    Text({}),
-    Text({ content: " Run: bun run finsentry setup", fg: "#888888" })
-  )
 }
 
 function dashboardScreen(): any {
-  const maps = getMaps()
-  const scan = getLatestScan()
+  const maps = safeRead(() => getMaps(), [] as MAP[])
+  const scan = safeRead(() => getLatestScan(), null)
+  const validations = scan ? safeRead(() => getValidations(scan.id), [] as Validation[]) : []
+  const regulations = loadRegulations()
+  const documents = safeRead(() => getDocuments(), [] as Document[])
+  const setup = safeRead(() => getSetupState(), null)
 
-  const items = [
-    `MAPs Extracted:      ${maps.length}`,
-    `Requirements:        ${maps.length > 0 ? maps.map((m) => m.requirement_id).join(", ") : "N/A"}`,
-    `Latest Scan:         ${scan ? scan.repo_path : "No scan yet"}`,
-    `Impacted Files:      ${scan ? scan.summary.impacted_files : "N/A"}`,
+  const score = complianceScore(validations)
+  const bar = scoreBar(score)
+  const stats = [
+    metric("RBI docs loaded", String(regulations.length || documents.length), regulations.length > 0 ? GOOD : WARN),
+    metric("Requirements", String(maps.length), maps.length > 0 ? GOOD : WARN),
+    metric("Latest scan", scan ? `#${scan.id}` : "none", scan ? GOOD : WARN),
+    metric("Compliance", validations.length > 0 ? `${score}% ${bar}` : "pending", validations.length > 0 ? scoreColor(score) : WARN),
+    metric("Offline agent", setup?.completed ? "ready" : "local mode", GOOD),
   ]
 
   return Box(
-    { flexDirection: "column", borderStyle: "rounded", padding: 1, gap: 1, flexGrow: 1 },
-    Text({ content: t`${fg("#00FF00")(" Dashboard ")}` }),
-    Box({ flexDirection: "column", gap: 0 }, ...items.map((i) => Text({ content: `  ${i}` }))),
+    { flexDirection: "column", borderStyle: "rounded", borderColor: CANARA_BLUE, padding: 1, gap: 1, flexGrow: 1 },
+    Text({ content: t`${fg(CANARA_SAFFRON)(bold(" Dashboard "))}` }),
+    Box({ flexDirection: "column", gap: 0 }, ...stats),
     Text({}),
-    Text({ content: " Commands:", fg: "#FFFF00" }),
-    Text({ content: "   bun run finsentry setup" }),
-    Text({ content: "   bun run finsentry scan <repo>" }),
-    Text({ content: "   bun run finsentry validate" }),
-    Text({ content: "   bun run finsentry mcp" })
+    Text({ content: "Mandate workflow", fg: CANARA_SAFFRON, attributes: TextAttributes.BOLD }),
+    Text({ content: "  RBI PDF intake -> MAP requirements -> repository scan -> validation proof", fg: "#DCE6F2" }),
+    Text({ content: `  Last scan: ${formatScan(scan)}`, fg: MUTED }),
+    Text({}),
+    Text({ content: "Slash commands", fg: CANARA_SAFFRON, attributes: TextAttributes.BOLD }),
+    ...COMMANDS.map((command) => Text({ content: `  ${command.name.padEnd(10)} ${command.description}`, fg: "#DCE6F2" }))
   )
 }
 
-function mapsScreen(): any {
-  const maps = getMaps()
+function regulationsScreen(): any {
+  const regulations = loadRegulations()
 
-  if (maps.length === 0) {
-    return Box(
-      { borderStyle: "rounded", padding: 1, flexGrow: 1 },
-      Text({ content: " No MAPs extracted. Run: bun run finsentry setup ", fg: "#888888" })
+  if (regulations.length === 0) {
+    return emptyPanel(
+      " Regulations ",
+      "No RBI documents are loaded yet. Run setup or ingest RBI PDFs, then return here for the 8 Master Directions."
     )
   }
 
-  const items = maps.flatMap((m) => [
+  const rows = regulations.map((reg) =>
     Text({
-      content: ` ${m.requirement_id} [${m.severity.toUpperCase()}] ${m.title}`,
-      fg: m.severity === "critical" ? "#FF0000" : m.severity === "high" ? "#FF8800" : "#AAAAAA",
-      attributes: TextAttributes.BOLD,
-    }),
-    Text({
-      content: `   ${m.description.slice(0, 120)}${m.description.length > 120 ? "..." : ""}`,
-      fg: "#CCCCCC",
-    }),
-    Text({
-      content: `   Criteria: ${m.measurable_criteria.join(" | ")}`,
-      fg: "#888888",
-    }),
-    Text({}),
-  ])
+      content: ` ${reg.id.padEnd(12)} ${trim(reg.name, 38).padEnd(40)} ${reg.category.padEnd(16)} ${reg.pageCount
+        .toString()
+        .padStart(4)}p  ${formatDate(reg.fetchedAt)}`,
+      fg: reg.source === "regulation" ? "#DCE6F2" : MUTED,
+    })
+  )
 
   return ScrollBox(
-    { borderStyle: "rounded", padding: 1, flexGrow: 1 },
+    { borderStyle: "rounded", borderColor: CANARA_BLUE, padding: 1, flexGrow: 1 },
     Box(
       { flexDirection: "column", gap: 0 },
-      Text({ content: t`${fg("#00AAFF")(` Measurable Action Points (${maps.length}) `)}` }),
+      Text({ content: t`${fg(CANARA_SAFFRON)(bold(` Regulations (${regulations.length}) `))}` }),
+      Text({ content: " ID           Name                                     Category          Page  Fetched", fg: MUTED }),
+      Text({ content: " -------------------------------------------------------------------------------", fg: CANARA_BLUE }),
+      ...rows
+    )
+  )
+}
+
+function requirementsScreen(): any {
+  const maps = safeRead(() => getMaps(), [] as MAP[])
+
+  if (maps.length === 0) {
+    return emptyPanel(
+      " Requirements ",
+      "No requirements are available yet. After RBI documents are parsed, extracted MAPs will appear with status badges."
+    )
+  }
+
+  const latestScan = safeRead(() => getLatestScan(), null)
+  const validations = latestScan ? safeRead(() => getValidations(latestScan.id), [] as Validation[]) : []
+
+  const rows = maps.flatMap((map) => {
+    const validation = validations.find((item) => item.map_id === map.id)
+    const badge = statusBadge(validation?.status)
+    return [
+      Text({
+        content: ` ${badge.icon} ${map.requirement_id} [${map.severity.toUpperCase()}] ${map.title}`,
+        fg: badge.color,
+        attributes: TextAttributes.BOLD,
+      }),
+      Text({ content: `   ${trim(map.description, 120)}`, fg: "#DCE6F2" }),
+      Text({ content: `   Evidence hints: ${map.verification_hints.join(" | ") || "pending"}`, fg: MUTED }),
       Text({}),
-      ...items
+    ]
+  })
+
+  return ScrollBox(
+    { borderStyle: "rounded", borderColor: CANARA_BLUE, padding: 1, flexGrow: 1 },
+    Box(
+      { flexDirection: "column", gap: 0 },
+      Text({ content: t`${fg(CANARA_SAFFRON)(bold(` Requirements (${maps.length}) `))}` }),
+      Text({ content: " Green = satisfied, red = missing, amber = needs review, ? = not validated", fg: MUTED }),
+      Text({}),
+      ...rows
     )
   )
 }
 
 function scanScreen(): any {
-  const scan = getLatestScan()
+  const scan = safeRead(() => getLatestScan(), null)
 
-  const content = scan
-    ? Box(
-        { flexDirection: "column", gap: 0 },
-        Text({ content: ` Repo:    ${scan.repo_path}` }),
-        Text({ content: ` When:    ${scan.scanned_at}` }),
-        Text({ content: ` Files:   ${scan.summary.total_files}` }),
-        Text({ content: ` Hit:     ${scan.summary.impacted_files}` }),
-        Text({ content: ` MAPs:    ${scan.summary.maps_checked}` })
-      )
-    : Text({ content: " No scan results. Run: bun run finsentry scan <repo-path> ", fg: "#888888" })
+  if (!scan) {
+    return emptyPanel(" Scan ", "No scan history yet. Run: bun run finsentry scan <repo-path>")
+  }
 
-  return Box(
-    { flexDirection: "column", borderStyle: "rounded", padding: 1, gap: 1, flexGrow: 1 },
-    Text({ content: t`${fg("#FF8800")(" Repository Scan ")}` }),
-    content,
-    Text({}),
-    Text({ content: " Run: bun run finsentry scan ./examples/sample-banking-app", fg: "#FFFF00" })
+  const results = safeRead(() => getScanResults(scan.id), [])
+  const impacted = unique(results.map((result) => result.filepath))
+
+  return ScrollBox(
+    { borderStyle: "rounded", borderColor: CANARA_BLUE, padding: 1, flexGrow: 1 },
+    Box(
+      { flexDirection: "column", gap: 0 },
+      Text({ content: t`${fg(CANARA_SAFFRON)(bold(` Scan #${scan.id} `))}` }),
+      Text({ content: ` Repo:      ${scan.repo_path}`, fg: "#DCE6F2" }),
+      Text({ content: ` When:      ${formatDate(scan.scanned_at)}`, fg: "#DCE6F2" }),
+      Text({ content: ` Files:     ${scan.summary.total_files}`, fg: "#DCE6F2" }),
+      Text({ content: ` Impacted:  ${scan.summary.impacted_files}`, fg: scan.summary.impacted_files > 0 ? WARN : GOOD }),
+      Text({ content: ` Checked:   ${scan.summary.maps_checked} requirements`, fg: "#DCE6F2" }),
+      Text({}),
+      Text({ content: "Impacted files", fg: CANARA_SAFFRON, attributes: TextAttributes.BOLD }),
+      ...(impacted.length > 0
+        ? impacted.slice(0, 24).map((file) => Text({ content: `  ${file}`, fg: MUTED }))
+        : [Text({ content: "  No impacted files were recorded for this scan.", fg: MUTED })])
+    )
   )
 }
 
 function validateScreen(): any {
-  const scan = getLatestScan()
+  const scan = safeRead(() => getLatestScan(), null)
 
   if (!scan) {
-    return Box(
-      { borderStyle: "rounded", padding: 1, flexGrow: 1 },
-      Text({ content: " No validation results. Run a scan first. ", fg: "#888888" })
-    )
+    return emptyPanel(" Validate ", "Run a repository scan first, then run: bun run finsentry validate")
   }
 
-  const validations = getValidations(scan.id)
-
+  const validations = safeRead(() => getValidations(scan.id), [] as Validation[])
   if (validations.length === 0) {
-    return Box(
-      { borderStyle: "rounded", padding: 1, flexGrow: 1 },
-      Text({ content: " Run: bun run finsentry validate ", fg: "#888888" })
-    )
+    return emptyPanel(" Validate ", "No validation rows yet. Run: bun run finsentry validate")
   }
 
   const sat = validations.filter((v) => v.status === "satisfied").length
   const miss = validations.filter((v) => v.status === "missing").length
-  const rev = validations.filter((v) => v.status === "needs_review").length
-
-  const items = validations.map((v) => {
-    const color = v.status === "satisfied" ? "#00FF00" : v.status === "missing" ? "#FF0000" : "#FF8800"
-    const icon = v.status === "satisfied" ? "✓" : v.status === "missing" ? "✗" : "?"
-    return Text({
-      content: ` ${icon} MAP #${v.map_id}: ${v.status}${v.details ? " " + v.details.slice(0, 120) : ""}`,
-      fg: color,
-    })
-  })
-
-  const headerText = ` Validation  (✓${sat}  ✗${miss}  ?${rev}) `
+  const review = validations.filter((v) => v.status === "needs_review").length
 
   return ScrollBox(
-    { borderStyle: "rounded", padding: 1, flexGrow: 1 },
+    { borderStyle: "rounded", borderColor: CANARA_BLUE, padding: 1, flexGrow: 1 },
     Box(
       { flexDirection: "column", gap: 0 },
-      Text({ content: t`${fg("#00AAFF")(headerText)}` }),
+      Text({ content: t`${fg(CANARA_SAFFRON)(bold(" Validate "))}` }),
+      Text({ content: ` Compliance score: ${complianceScore(validations)}% ${scoreBar(complianceScore(validations))}`, fg: scoreColor(complianceScore(validations)) }),
+      Text({ content: ` Satisfied: ${sat} | Missing: ${miss} | Needs review: ${review}`, fg: MUTED }),
       Text({}),
-      ...items
+      ...validations.map((validation) => {
+        const badge = statusBadge(validation.status)
+        return Text({
+          content: ` ${badge.icon} MAP #${validation.map_id}: ${validation.status}${validation.details ? ` - ${trim(validation.details, 120)}` : ""}`,
+          fg: badge.color,
+        })
+      })
     )
   )
 }
 
-function mcpScreen(): any {
+function aboutScreen(): any {
   return Box(
-    { flexDirection: "column", borderStyle: "rounded", padding: 1, gap: 1, flexGrow: 1 },
-    Text({ content: t`${fg("#FF00FF")(" MCP Server ")}` }),
-    Text({ content: " Start: bun run finsentry mcp", fg: "#FFFF00" }),
+    { flexDirection: "column", borderStyle: "double", borderColor: CANARA_BLUE, padding: 1, gap: 0, flexGrow: 1 },
+    Text({ content: t`${fg(CANARA_SAFFRON)(bold(" CANARA BANK "))}` }),
+    Text({ content: "  ____                              ____              _", fg: CANARA_SAFFRON }),
+    Text({ content: " / ___|__ _ _ __   __ _ _ __ __ _  | __ )  __ _ _ __ | | __", fg: CANARA_SAFFRON }),
+    Text({ content: "| |   / _` | '_ \\ / _` | '__/ _` | |  _ \\ / _` | '_ \\| |/ /", fg: CANARA_SAFFRON }),
+    Text({ content: "| |__| (_| | | | | (_| | | | (_| | | |_) | (_| | | | |   <", fg: CANARA_SAFFRON }),
+    Text({ content: " \\____\\__,_|_| |_|\\__,_|_|  \\__,_| |____/ \\__,_|_| |_|_|\\_\\", fg: CANARA_SAFFRON }),
     Text({}),
-    Text({ content: " Then add to your MCP client:", fg: "#00AAFF" }),
-    Text({ content: '   { "command": "bun", "args": ["src/main.ts", "mcp"] }' }),
+    Text({ content: "FinSentry", fg: "#FFFFFF", attributes: TextAttributes.BOLD }),
+    Text({ content: "Local-first compliance intelligence for RBI mandates and engineering proof.", fg: "#DCE6F2" }),
     Text({}),
-    Text({ content: " Tools:", fg: "#FFFF00" }),
-    Text({ content: "   list_maps" }),
-    Text({ content: "   get_map" }),
-    Text({ content: "   get_latest_scan" }),
-    Text({ content: "   find_impacted_files" }),
-    Text({ content: "   validate_requirement" }),
+    Text({ content: "Team credits", fg: CANARA_SAFFRON, attributes: TextAttributes.BOLD }),
+    Text({ content: "  Shreyash  - Dashboard lead, main stats, requirements, Canara branding polish", fg: "#DCE6F2" }),
+    Text({ content: "  Debasmita - Regulations and scan surfaces", fg: MUTED }),
+    Text({ content: "  Archita   - Validate and about surfaces", fg: MUTED }),
+    Text({ content: "  Pranshu   - MCP server and RBI data pipeline", fg: MUTED }),
     Text({}),
-    Text({ content: " Resources:", fg: "#FFFF00" }),
-    Text({ content: "   finsentry://maps/latest" }),
-    Text({ content: "   finsentry://scan/latest" })
+    Text({ content: "Offline slash commands", fg: CANARA_SAFFRON, attributes: TextAttributes.BOLD }),
+    ...COMMANDS.map((command) => Text({ content: `  ${command.name.padEnd(10)} ${command.description}`, fg: "#DCE6F2" }))
   )
+}
+
+function emptyPanel(title: string, message: string): any {
+  return Box(
+    { flexDirection: "column", borderStyle: "rounded", borderColor: CANARA_BLUE, padding: 1, gap: 1, flexGrow: 1 },
+    Text({ content: t`${fg(CANARA_SAFFRON)(bold(title))}` }),
+    Text({ content: ` ${message}`, fg: MUTED })
+  )
+}
+
+function metric(label: string, value: string, color: string): any {
+  return Text({
+    content: ` ${label.padEnd(18)} ${value}`,
+    fg: color,
+  })
+}
+
+function loadRegulations(): RegulationSummary[] {
+  const fromRegulations = safeRead(() => {
+    const db = getDb()
+    const table = db.query<{ name: string }, []>("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'regulations'").get()
+    if (!table) return []
+
+    return db
+      .query<any, []>(
+        "SELECT id, name, category, fetched_at, page_count FROM regulations ORDER BY category, id"
+      )
+      .all()
+      .map((row) => ({
+        id: String(row.id),
+        name: String(row.name),
+        category: String(row.category),
+        fetchedAt: String(row.fetched_at ?? ""),
+        pageCount: Number(row.page_count ?? 0),
+        source: "regulation" as const,
+      }))
+  }, [] as RegulationSummary[])
+
+  if (fromRegulations.length > 0) return fromRegulations
+
+  return safeRead(() => getDocuments(), [] as Document[]).map((doc) => ({
+    id: `DOC-${doc.id}`,
+    name: doc.filename,
+    category: doc.is_seeded ? "seeded" : "ingested",
+    fetchedAt: doc.ingested_at,
+    pageCount: 0,
+    source: "document" as const,
+  }))
+}
+
+function complianceScore(validations: Validation[]): number {
+  if (validations.length === 0) return 0
+  const satisfied = validations.filter((v) => v.status === "satisfied").length
+  return Math.round((satisfied / validations.length) * 100)
+}
+
+function scoreBar(score: number): string {
+  const filled = Math.round(score / 10)
+  return `[${"#".repeat(filled)}${"-".repeat(10 - filled)}]`
+}
+
+function scoreColor(score: number): string {
+  if (score >= 80) return GOOD
+  if (score >= 50) return WARN
+  return BAD
+}
+
+function statusBadge(status?: Validation["status"]): { icon: string; color: string } {
+  if (status === "satisfied") return { icon: "OK", color: GOOD }
+  if (status === "missing") return { icon: "NO", color: BAD }
+  if (status === "needs_review") return { icon: "??", color: WARN }
+  return { icon: "?", color: MUTED }
+}
+
+function formatScan(scan: Scan | null): string {
+  if (!scan) return "no scan yet"
+  return `${scan.repo_path} at ${formatDate(scan.scanned_at)}`
+}
+
+function formatDate(value: string): string {
+  if (!value) return "pending"
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return value
+  return date.toLocaleString()
+}
+
+function trim(value: string, max: number): string {
+  return value.length <= max ? value : `${value.slice(0, Math.max(0, max - 3))}...`
+}
+
+function unique(values: string[]): string[] {
+  return [...new Set(values)]
+}
+
+function safeRead<T>(read: () => T, fallback: T): T {
+  try {
+    return read()
+  } catch {
+    return fallback
+  }
 }
