@@ -4,9 +4,9 @@ import { getDb, getDocuments, getLatestScan, getMaps, getScanResults, getValidat
 import { COMMANDS, getCommandHelp, parseSlashCommand, runOfflineCommand } from "./commands"
 import type { Document, MAP, Scan, Validation } from "./types"
 
-type ScreenName = "dashboard" | "regulations" | "requirements" | "scan" | "validate" | "about"
+type ScreenName = "dashboard" | "regulations" | "requirements" | "auth-demo" | "scan" | "validate" | "about"
 
-const SCREEN_NAMES: ScreenName[] = ["dashboard", "regulations", "requirements", "scan", "validate", "about"]
+const SCREEN_NAMES: ScreenName[] = ["dashboard", "regulations", "requirements", "auth-demo", "scan", "validate", "about"]
 
 const CANARA_BLUE = "#003366"
 const CANARA_SAFFRON = "#FF9933"
@@ -56,6 +56,7 @@ function buildApp(state: AppState, reRender: () => void): any {
       { name: "Dashboard", description: "Stats" },
       { name: "Regulations", description: "RBI docs" },
       { name: "Requirements", description: "Controls" },
+      { name: "Auth Demo", description: "RBI auth" },
       { name: "Scan", description: "History" },
       { name: "Validate", description: "Proof" },
       { name: "About", description: "Canara" },
@@ -95,7 +96,7 @@ function header(): any {
 }
 
 function footer(screen: ScreenName): any {
-  const command = parseSlashCommand(screen === "about" ? "/about" : "/status")
+  const command = parseSlashCommand(screen === "about" ? "/about" : screen === "auth-demo" ? "/auth" : "/status")
   const preview = runOfflineCommand(command)
 
   return Box(
@@ -115,6 +116,8 @@ function buildScreen(screen: ScreenName): any {
       return regulationsScreen()
     case "requirements":
       return requirementsScreen()
+    case "auth-demo":
+      return authDemoScreen()
     case "scan":
       return scanScreen()
     case "validate":
@@ -223,6 +226,77 @@ function requirementsScreen(): any {
       Text({ content: " Green = satisfied, red = missing, amber = needs review, ? = not validated", fg: MUTED }),
       Text({}),
       ...rows
+    )
+  )
+}
+
+function authDemoScreen(): any {
+  const maps = safeRead(() => getMaps(), [] as MAP[])
+  const authMaps = maps.filter((map) => {
+    const haystack = `${map.requirement_id} ${map.title} ${map.description} ${map.verification_hints.join(" ")}`.toLowerCase()
+    return ["auth", "login", "password", "mfa", "otp", "session", "token"].some((keyword) => haystack.includes(keyword))
+  })
+
+  const demoRows = [
+    {
+      id: "AUTH-001",
+      control: "Multi-factor authentication for privileged and customer-sensitive actions",
+      evidence: "auth/mfa.ts, otp.service.ts, transaction-approval.ts",
+      status: "needs_review" as const,
+    },
+    {
+      id: "AUTH-002",
+      control: "Strong session expiry, token rotation, and replay protection",
+      evidence: "session.middleware.ts, jwt-rotation.ts",
+      status: "satisfied" as const,
+    },
+    {
+      id: "AUTH-003",
+      control: "Audit trail for failed login attempts and account lock events",
+      evidence: "login.controller.ts, audit-log.repository.ts",
+      status: "missing" as const,
+    },
+    {
+      id: "AUTH-004",
+      control: "Step-up authentication for risky device or beneficiary changes",
+      evidence: "risk-engine.ts, device-binding.ts",
+      status: "needs_review" as const,
+    },
+  ]
+
+  const authSummary = authMaps.length > 0
+    ? `${authMaps.length} extracted authentication requirement(s) found in local DB`
+    : "Demo mode: auth requirements will bind to RBI extracted MAPs after setup"
+
+  return ScrollBox(
+    { borderStyle: "rounded", borderColor: CANARA_BLUE, padding: 1, flexGrow: 1 },
+    Box(
+      { flexDirection: "column", gap: 0 },
+      Text({ content: t`${fg(CANARA_SAFFRON)(bold(" Authentication Compliance Demo "))}` }),
+      Text({ content: " RBI authentication mandate -> code evidence -> proof status", fg: MUTED }),
+      Text({ content: ` ${authSummary}`, fg: authMaps.length > 0 ? GOOD : WARN }),
+      Text({}),
+      Text({ content: "Demo checks", fg: CANARA_SAFFRON, attributes: TextAttributes.BOLD }),
+      ...demoRows.flatMap((row) => {
+        const badge = statusBadge(row.status)
+        return [
+          Text({
+            content: ` ${badge.icon} ${row.id} ${row.control}`,
+            fg: badge.color,
+            attributes: TextAttributes.BOLD,
+          }),
+          Text({ content: `   Evidence: ${row.evidence}`, fg: "#DCE6F2" }),
+          Text({}),
+        ]
+      }),
+      Text({ content: "Offline agent prompt", fg: CANARA_SAFFRON, attributes: TextAttributes.BOLD }),
+      Text({ content: '  "Check my auth code against RBI authentication guidelines."', fg: "#DCE6F2" }),
+      Text({ content: "  Expected path: /auth -> /scan -> /validate -> evidence-backed status", fg: MUTED }),
+      Text({}),
+      Text({ content: "Live extracted auth requirements", fg: CANARA_SAFFRON, attributes: TextAttributes.BOLD }),
+      ...(authMaps.length > 0
+        ? authMaps.slice(0, 8).map((map) => Text({ content: `  ${map.requirement_id}: ${trim(map.title, 88)}`, fg: "#DCE6F2" }))
+        : [Text({ content: "  No local auth MAPs yet. Run setup/ingest when Pranshu data pipeline is ready.", fg: MUTED })])
     )
   )
 }
