@@ -1,484 +1,284 @@
-import { Box, ScrollBox, TabSelect, Text, TextAttributes, bold, createCliRenderer, fg, t } from "@opentui/core"
-import { getSetupState } from "./setup"
-import { getDb, getDocuments, getLatestScan, getMaps, getScanResults, getValidations } from "./db"
-import { COMMANDS, getCommandHelp, parseSlashCommand, runOfflineCommand } from "./commands"
-import type { Document, MAP, Scan, Validation } from "./types"
+import { readFileSync } from "node:fs"
+import { join } from "node:path"
+import { getSetupState, runSetup } from "./setup"
+import { getDocuments, getLatestScan, getMaps, getValidations } from "./db"
+import { COMMANDS, parseSlashCommand, runOfflineCommand } from "./commands"
+import { isOllamaInstalled, isOllamaRunning, listModels } from "./ollama"
 
-type ScreenName = "dashboard" | "regulations" | "requirements" | "auth-demo" | "scan" | "validate" | "about"
+const PORT = Number(process.env.FINSENTRY_DASHBOARD_PORT ?? 4173)
 
-const SCREEN_NAMES: ScreenName[] = ["dashboard", "regulations", "requirements", "auth-demo", "scan", "validate", "about"]
-
-const CANARA_BLUE = "#003366"
-const CANARA_SAFFRON = "#FF9933"
-const GOOD = "#2E7D32"
-const BAD = "#C62828"
-const WARN = "#F9A825"
-const MUTED = "#8EA4B8"
-
-interface AppState {
-  selectedIndex: number
-}
-
-interface RegulationSummary {
-  id: string
-  name: string
-  category: string
-  fetchedAt: string
-  pageCount: number
-  source: "regulation" | "document"
+interface DashboardStatus {
+  setupCompleted: boolean
+  ollamaInstalled: boolean
+  ollamaRunning: boolean
+  models: string[]
+  documentsLoaded: number
+  requirementsExtracted: number
+  latestScan: string
+  validationScore: string
+  mcpReady: boolean
 }
 
 export async function launchTui(): Promise<void> {
-  const state: AppState = {
-    selectedIndex: 0,
+  const server = Bun.serve({
+    port: PORT,
+    async fetch(req) {
+      const url = new URL(req.url)
+
+      if (url.pathname === "/") return html(loginPage())
+      if (url.pathname === "/dashboard") return html(dashboardPage())
+      if (url.pathname === "/assets/canara-bank-logo.png") return logoResponse()
+      if (url.pathname === "/api/status") return json(await getStatus())
+      if (url.pathname === "/api/install" && req.method === "POST") return json(await runInstall())
+      if (url.pathname === "/api/slash" && req.method === "POST") return json(await runSlash(req))
+
+      return new Response("Not found", { status: 404 })
+    },
+  })
+
+  console.log("\nFinSentry dashboard is running.")
+  console.log(`Open: http://localhost:${server.port}`)
+  console.log("MCP still runs separately with: bun src/main.ts mcp")
+  console.log("Press Ctrl+C to stop.\n")
+
+  await new Promise(() => {})
+}
+
+function loginPage(): string {
+  return baseHtml("Login", `
+    <main class="auth-shell">
+      <section class="login-panel">
+        <img class="brand-logo" src="/assets/canara-bank-logo.png" alt="Canara Bank logo" />
+        <p class="eyebrow">Canara Bank</p>
+        <h1>FinSentry</h1>
+        <p class="subtitle">RBI compliance intelligence for authentication, regulations, and local MCP evidence.</p>
+
+        <form class="login-form" onsubmit="event.preventDefault(); login();">
+          <label>
+            Employee ID
+            <input id="loginId" autocomplete="username" placeholder="CB00123" required />
+          </label>
+          <label>
+            Name
+            <input id="loginName" autocomplete="name" placeholder="Branch Manager" required />
+          </label>
+          <button type="submit">Enter dashboard</button>
+        </form>
+      </section>
+    </main>
+    <script>
+      function login() {
+        const id = document.getElementById("loginId").value.trim();
+        const name = document.getElementById("loginName").value.trim();
+        if (!id || !name) return;
+        sessionStorage.setItem("finsentryUser", JSON.stringify({ id, name }));
+        window.location.href = "/dashboard";
+      }
+    </script>
+  `)
+}
+
+function dashboardPage(): string {
+  return baseHtml("Dashboard", `
+    <main class="dashboard-shell">
+      <aside class="sidebar">
+        <img class="side-logo" src="/assets/canara-bank-logo.png" alt="Canara Bank logo" />
+        <div>
+          <p class="eyebrow">Canara Bank</p>
+          <h1>FinSentry</h1>
+        </div>
+        <div class="user-card">
+          <span id="userName">Compliance User</span>
+          <small id="userId">ID pending</small>
+        </div>
+        <nav>
+          <button onclick="runCommand('/install')">/install</button>
+          <button onclick="runCommand('/status')">/status</button>
+          <button onclick="runCommand('/help')">/help</button>
+        </nav>
+      </aside>
+
+      <section class="main-panel">
+        <header class="topbar">
+          <div>
+            <p class="eyebrow">Local MCP dashboard</p>
+            <h2>Authentication and RBI Regulation Control Room</h2>
+          </div>
+          <div class="status-pill" id="mcpState">Checking MCP...</div>
+        </header>
+
+        <section class="hero-grid">
+          <article class="hero-card">
+            <h3>Authentication Page</h3>
+            <p>Validate high-risk login, MFA, session, and failed-login controls before a regulation review.</p>
+            <div class="control-list">
+              <div><strong>AUTH-001</strong><span>Multi-factor authentication</span><b class="warn">Review</b></div>
+              <div><strong>AUTH-002</strong><span>Session expiry and token rotation</span><b class="ok">Ready</b></div>
+              <div><strong>AUTH-003</strong><span>Failed login monitoring</span><b class="bad">Action</b></div>
+            </div>
+          </article>
+
+          <article class="command-card">
+            <h3>Slash Commands</h3>
+            <p>Only these commands are enabled for staff use.</p>
+            <div class="slash-row">
+              <button onclick="runCommand('/install')">/install</button>
+              <button onclick="runCommand('/status')">/status</button>
+              <button onclick="runCommand('/help')">/help</button>
+            </div>
+            <input id="slashInput" placeholder="Type /status" onkeydown="if(event.key==='Enter') runCommand(this.value)" />
+          </article>
+        </section>
+
+        <section class="metrics">
+          <article><span>Setup</span><strong id="setupMetric">-</strong></article>
+          <article><span>Regulations</span><strong id="docsMetric">-</strong></article>
+          <article><span>Requirements</span><strong id="reqMetric">-</strong></article>
+          <article><span>Validation</span><strong id="validationMetric">-</strong></article>
+        </section>
+
+        <section class="workbench">
+          <article>
+            <h3>Manager View</h3>
+            <p id="managerSummary">Loading status...</p>
+            <div class="button-row">
+              <button onclick="runCommand('/install')">Install / refresh regulations</button>
+              <button onclick="runCommand('/status')">Check readiness</button>
+              <button onclick="runCommand('/help')">Show help</button>
+            </div>
+          </article>
+          <article>
+            <h3>Command Output</h3>
+            <pre id="commandOutput">Use /status to inspect local MCP and regulation readiness.</pre>
+          </article>
+        </section>
+      </section>
+    </main>
+    <script>
+      const user = JSON.parse(sessionStorage.getItem("finsentryUser") || "{}");
+      if (!user.id || !user.name) window.location.href = "/";
+      document.getElementById("userName").textContent = user.name || "Compliance User";
+      document.getElementById("userId").textContent = user.id ? "ID " + user.id : "ID pending";
+
+      async function refreshStatus() {
+        const status = await fetch("/api/status").then((r) => r.json());
+        document.getElementById("mcpState").textContent = status.mcpReady ? "MCP ready" : "MCP needs setup";
+        document.getElementById("setupMetric").textContent = status.setupCompleted ? "Ready" : "Install";
+        document.getElementById("docsMetric").textContent = status.documentsLoaded;
+        document.getElementById("reqMetric").textContent = status.requirementsExtracted;
+        document.getElementById("validationMetric").textContent = status.validationScore;
+        document.getElementById("managerSummary").textContent =
+          "Local MCP is " + (status.mcpReady ? "available" : "not ready") +
+          ". " + status.documentsLoaded + " regulation document(s), " +
+          status.requirementsExtracted + " requirement(s), latest scan: " + status.latestScan + ".";
+      }
+
+      async function runCommand(raw) {
+        const command = (raw || "").trim();
+        if (!command) return;
+        document.getElementById("commandOutput").textContent = "Running " + command + "...";
+        const result = await fetch("/api/slash", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ command })
+        }).then((r) => r.json());
+        document.getElementById("commandOutput").textContent = result.output;
+        await refreshStatus();
+      }
+
+      refreshStatus();
+    </script>
+  `)
+}
+
+async function runSlash(req: Request): Promise<{ output: string }> {
+  const body = await req.json().catch(() => ({ command: "/help" })) as { command?: string }
+  const command = parseSlashCommand(body.command ?? "/help")
+
+  if (command.kind === "install") {
+    const result = await runInstall()
+    return { output: result.message }
   }
 
-  const renderer = await createCliRenderer({ exitOnCtrlC: true })
-  let currentApp: any = null
-
-  function render(): void {
-    if (currentApp !== null) {
-      renderer.root.remove(currentApp)
+  if (command.kind === "status") {
+    const status = await getStatus()
+    return {
+      output: [
+        "FinSentry Status",
+        `Setup completed: ${status.setupCompleted ? "Yes" : "No"}`,
+        `Ollama installed: ${status.ollamaInstalled ? "Yes" : "No"}`,
+        `Ollama running: ${status.ollamaRunning ? "Yes" : "No"}`,
+        `Models: ${status.models.length > 0 ? status.models.join(", ") : "None"}`,
+        `Regulation documents: ${status.documentsLoaded}`,
+        `Requirements: ${status.requirementsExtracted}`,
+        `Latest scan: ${status.latestScan}`,
+        `Validation: ${status.validationScore}`,
+      ].join("\\n"),
     }
-
-    currentApp = buildApp(state, render)
-    renderer.root.add(currentApp)
   }
 
-  render()
+  return { output: runOfflineCommand(command).body }
 }
 
-function buildApp(state: AppState, reRender: () => void): any {
-  const tabs = TabSelect({
-    width: 96,
-    tabWidth: 16,
-    options: [
-      { name: "Dashboard", description: "Stats" },
-      { name: "Regulations", description: "RBI docs" },
-      { name: "Requirements", description: "Controls" },
-      { name: "Auth Demo", description: "RBI auth" },
-      { name: "Scan", description: "History" },
-      { name: "Validate", description: "Proof" },
-      { name: "About", description: "Canara" },
-    ],
-  })
-
-  tabs.on("selectionChanged", (index: number) => {
-    state.selectedIndex = index
-    reRender()
-  })
-  tabs.focus()
-
-  const screen = SCREEN_NAMES[state.selectedIndex] ?? "dashboard"
-
-  return Box(
-    { flexDirection: "column", padding: 1, gap: 1, height: "100%" },
-    header(),
-    Box({ padding: 1, borderStyle: "single", borderColor: CANARA_BLUE }, tabs),
-    buildScreen(screen),
-    footer(screen)
-  )
-}
-
-function header(): any {
-  return Box(
-    { flexDirection: "column", borderStyle: "double", borderColor: CANARA_BLUE, padding: 1, gap: 0 },
-    Text({ content: t`${fg(CANARA_SAFFRON)(bold(" CANARA BANK  "))}${fg("#FFFFFF")(bold("FinSentry"))}` }),
-    Text({
-      content: " Programmatic RBI compliance proof for banking engineering teams ",
-      fg: MUTED,
-    }),
-    Text({
-      content: " Offline agent ready | RBI mandates -> requirements -> scans -> validation evidence ",
-      fg: CANARA_SAFFRON,
-    })
-  )
-}
-
-function footer(screen: ScreenName): any {
-  const command = parseSlashCommand(screen === "about" ? "/about" : screen === "auth-demo" ? "/auth" : "/status")
-  const preview = runOfflineCommand(command)
-
-  return Box(
-    { borderStyle: "single", borderColor: CANARA_BLUE, padding: 1 },
-    Text({
-      content: ` Ctrl+C exit | arrows switch tabs | ${getCommandHelp()} | offline: ${preview.title}`,
-      fg: MUTED,
-    })
-  )
-}
-
-function buildScreen(screen: ScreenName): any {
-  switch (screen) {
-    case "dashboard":
-      return dashboardScreen()
-    case "regulations":
-      return regulationsScreen()
-    case "requirements":
-      return requirementsScreen()
-    case "auth-demo":
-      return authDemoScreen()
-    case "scan":
-      return scanScreen()
-    case "validate":
-      return validateScreen()
-    case "about":
-      return aboutScreen()
+async function runInstall(): Promise<{ message: string }> {
+  const messages: string[] = []
+  try {
+    const state = await runSetup((msg) => messages.push(msg))
+    return {
+      message: [
+        "Install complete.",
+        `Database: ${state.db_initialized ? "Ready" : "Pending"}`,
+        `Ollama: ${state.ollama_installed ? "Ready" : "Pending"}`,
+        `Model: ${state.model_pulled ? "Ready" : "Pending"}`,
+        `Requirements: ${state.maps_extracted ? "Ready" : "Pending"}`,
+        "",
+        ...messages.slice(-8),
+      ].join("\\n"),
+    }
+  } catch (error) {
+    return { message: `Install failed: ${error instanceof Error ? error.message : String(error)}` }
   }
 }
 
-function dashboardScreen(): any {
-  const maps = safeRead(() => getMaps(), [] as MAP[])
-  const scan = safeRead(() => getLatestScan(), null)
-  const validations = scan ? safeRead(() => getValidations(scan.id), [] as Validation[]) : []
-  const regulations = loadRegulations()
-  const documents = safeRead(() => getDocuments(), [] as Document[])
+async function getStatus(): Promise<DashboardStatus> {
   const setup = safeRead(() => getSetupState(), null)
-
-  const score = complianceScore(validations)
-  const bar = scoreBar(score)
-  const stats = [
-    metric("RBI docs loaded", String(regulations.length || documents.length), regulations.length > 0 ? GOOD : WARN),
-    metric("Requirements", String(maps.length), maps.length > 0 ? GOOD : WARN),
-    metric("Latest scan", scan ? `#${scan.id}` : "none", scan ? GOOD : WARN),
-    metric("Compliance", validations.length > 0 ? `${score}% ${bar}` : "pending", validations.length > 0 ? scoreColor(score) : WARN),
-    metric("Offline agent", setup?.completed ? "ready" : "local mode", GOOD),
-  ]
-
-  return Box(
-    { flexDirection: "column", borderStyle: "rounded", borderColor: CANARA_BLUE, padding: 1, gap: 1, flexGrow: 1 },
-    Text({ content: t`${fg(CANARA_SAFFRON)(bold(" Dashboard "))}` }),
-    Box({ flexDirection: "column", gap: 0 }, ...stats),
-    Text({}),
-    Text({ content: "Mandate workflow", fg: CANARA_SAFFRON, attributes: TextAttributes.BOLD }),
-    Text({ content: "  RBI PDF intake -> MAP requirements -> repository scan -> validation proof", fg: "#DCE6F2" }),
-    Text({ content: `  Last scan: ${formatScan(scan)}`, fg: MUTED }),
-    Text({}),
-    Text({ content: "Slash commands", fg: CANARA_SAFFRON, attributes: TextAttributes.BOLD }),
-    ...COMMANDS.map((command) => Text({ content: `  ${command.name.padEnd(10)} ${command.description}`, fg: "#DCE6F2" }))
-  )
-}
-
-function regulationsScreen(): any {
-  const regulations = loadRegulations()
-
-  if (regulations.length === 0) {
-    return emptyPanel(
-      " Regulations ",
-      "No RBI documents are loaded yet. Run setup or ingest RBI PDFs, then return here for the 8 Master Directions."
-    )
-  }
-
-  const rows = regulations.map((reg) =>
-    Text({
-      content: ` ${reg.id.padEnd(12)} ${trim(reg.name, 38).padEnd(40)} ${reg.category.padEnd(16)} ${reg.pageCount
-        .toString()
-        .padStart(4)}p  ${formatDate(reg.fetchedAt)}`,
-      fg: reg.source === "regulation" ? "#DCE6F2" : MUTED,
-    })
-  )
-
-  return ScrollBox(
-    { borderStyle: "rounded", borderColor: CANARA_BLUE, padding: 1, flexGrow: 1 },
-    Box(
-      { flexDirection: "column", gap: 0 },
-      Text({ content: t`${fg(CANARA_SAFFRON)(bold(` Regulations (${regulations.length}) `))}` }),
-      Text({ content: " ID           Name                                     Category          Page  Fetched", fg: MUTED }),
-      Text({ content: " -------------------------------------------------------------------------------", fg: CANARA_BLUE }),
-      ...rows
-    )
-  )
-}
-
-function requirementsScreen(): any {
-  const maps = safeRead(() => getMaps(), [] as MAP[])
-
-  if (maps.length === 0) {
-    return emptyPanel(
-      " Requirements ",
-      "No requirements are available yet. After RBI documents are parsed, extracted MAPs will appear with status badges."
-    )
-  }
-
-  const latestScan = safeRead(() => getLatestScan(), null)
-  const validations = latestScan ? safeRead(() => getValidations(latestScan.id), [] as Validation[]) : []
-
-  const rows = maps.flatMap((map) => {
-    const validation = validations.find((item) => item.map_id === map.id)
-    const badge = statusBadge(validation?.status)
-    return [
-      Text({
-        content: ` ${badge.icon} ${map.requirement_id} [${map.severity.toUpperCase()}] ${map.title}`,
-        fg: badge.color,
-        attributes: TextAttributes.BOLD,
-      }),
-      Text({ content: `   ${trim(map.description, 120)}`, fg: "#DCE6F2" }),
-      Text({ content: `   Evidence hints: ${map.verification_hints.join(" | ") || "pending"}`, fg: MUTED }),
-      Text({}),
-    ]
-  })
-
-  return ScrollBox(
-    { borderStyle: "rounded", borderColor: CANARA_BLUE, padding: 1, flexGrow: 1 },
-    Box(
-      { flexDirection: "column", gap: 0 },
-      Text({ content: t`${fg(CANARA_SAFFRON)(bold(` Requirements (${maps.length}) `))}` }),
-      Text({ content: " Green = satisfied, red = missing, amber = needs review, ? = not validated", fg: MUTED }),
-      Text({}),
-      ...rows
-    )
-  )
-}
-
-function authDemoScreen(): any {
-  const maps = safeRead(() => getMaps(), [] as MAP[])
-  const authMaps = maps.filter((map) => {
-    const haystack = `${map.requirement_id} ${map.title} ${map.description} ${map.verification_hints.join(" ")}`.toLowerCase()
-    return ["auth", "login", "password", "mfa", "otp", "session", "token"].some((keyword) => haystack.includes(keyword))
-  })
-
-  const demoRows = [
-    {
-      id: "AUTH-001",
-      control: "Multi-factor authentication for privileged and customer-sensitive actions",
-      evidence: "auth/mfa.ts, otp.service.ts, transaction-approval.ts",
-      status: "needs_review" as const,
-    },
-    {
-      id: "AUTH-002",
-      control: "Strong session expiry, token rotation, and replay protection",
-      evidence: "session.middleware.ts, jwt-rotation.ts",
-      status: "satisfied" as const,
-    },
-    {
-      id: "AUTH-003",
-      control: "Audit trail for failed login attempts and account lock events",
-      evidence: "login.controller.ts, audit-log.repository.ts",
-      status: "missing" as const,
-    },
-    {
-      id: "AUTH-004",
-      control: "Step-up authentication for risky device or beneficiary changes",
-      evidence: "risk-engine.ts, device-binding.ts",
-      status: "needs_review" as const,
-    },
-  ]
-
-  const authSummary = authMaps.length > 0
-    ? `${authMaps.length} extracted authentication requirement(s) found in local DB`
-    : "Demo mode: auth requirements will bind to RBI extracted MAPs after setup"
-
-  return ScrollBox(
-    { borderStyle: "rounded", borderColor: CANARA_BLUE, padding: 1, flexGrow: 1 },
-    Box(
-      { flexDirection: "column", gap: 0 },
-      Text({ content: t`${fg(CANARA_SAFFRON)(bold(" Authentication Compliance Demo "))}` }),
-      Text({ content: " RBI authentication mandate -> code evidence -> proof status", fg: MUTED }),
-      Text({ content: ` ${authSummary}`, fg: authMaps.length > 0 ? GOOD : WARN }),
-      Text({}),
-      Text({ content: "Demo checks", fg: CANARA_SAFFRON, attributes: TextAttributes.BOLD }),
-      ...demoRows.flatMap((row) => {
-        const badge = statusBadge(row.status)
-        return [
-          Text({
-            content: ` ${badge.icon} ${row.id} ${row.control}`,
-            fg: badge.color,
-            attributes: TextAttributes.BOLD,
-          }),
-          Text({ content: `   Evidence: ${row.evidence}`, fg: "#DCE6F2" }),
-          Text({}),
-        ]
-      }),
-      Text({ content: "Offline agent prompt", fg: CANARA_SAFFRON, attributes: TextAttributes.BOLD }),
-      Text({ content: '  "Check my auth code against RBI authentication guidelines."', fg: "#DCE6F2" }),
-      Text({ content: "  Expected path: /auth -> /scan -> /validate -> evidence-backed status", fg: MUTED }),
-      Text({}),
-      Text({ content: "Live extracted auth requirements", fg: CANARA_SAFFRON, attributes: TextAttributes.BOLD }),
-      ...(authMaps.length > 0
-        ? authMaps.slice(0, 8).map((map) => Text({ content: `  ${map.requirement_id}: ${trim(map.title, 88)}`, fg: "#DCE6F2" }))
-        : [Text({ content: "  No local auth MAPs yet. Run setup/ingest when Pranshu data pipeline is ready.", fg: MUTED })])
-    )
-  )
-}
-
-function scanScreen(): any {
+  const documents = safeRead(() => getDocuments(), [])
+  const maps = safeRead(() => getMaps(), [])
   const scan = safeRead(() => getLatestScan(), null)
+  const validations = scan ? safeRead(() => getValidations(scan.id), []) : []
+  const models = await listModels()
+  const ollamaInstalled = await isOllamaInstalled()
+  const ollamaRunning = await isOllamaRunning()
 
-  if (!scan) {
-    return emptyPanel(" Scan ", "No scan history yet. Run: bun run finsentry scan <repo-path>")
+  return {
+    setupCompleted: setup?.completed ?? false,
+    ollamaInstalled,
+    ollamaRunning,
+    models,
+    documentsLoaded: documents.length,
+    requirementsExtracted: maps.length,
+    latestScan: scan ? `#${scan.id} ${scan.repo_path}` : "No scan yet",
+    validationScore: validations.length > 0 ? `${score(validations)}%` : "Pending",
+    mcpReady: Boolean(setup?.completed && ollamaRunning),
   }
-
-  const results = safeRead(() => getScanResults(scan.id), [])
-  const impacted = unique(results.map((result) => result.filepath))
-
-  return ScrollBox(
-    { borderStyle: "rounded", borderColor: CANARA_BLUE, padding: 1, flexGrow: 1 },
-    Box(
-      { flexDirection: "column", gap: 0 },
-      Text({ content: t`${fg(CANARA_SAFFRON)(bold(` Scan #${scan.id} `))}` }),
-      Text({ content: ` Repo:      ${scan.repo_path}`, fg: "#DCE6F2" }),
-      Text({ content: ` When:      ${formatDate(scan.scanned_at)}`, fg: "#DCE6F2" }),
-      Text({ content: ` Files:     ${scan.summary.total_files}`, fg: "#DCE6F2" }),
-      Text({ content: ` Impacted:  ${scan.summary.impacted_files}`, fg: scan.summary.impacted_files > 0 ? WARN : GOOD }),
-      Text({ content: ` Checked:   ${scan.summary.maps_checked} requirements`, fg: "#DCE6F2" }),
-      Text({}),
-      Text({ content: "Impacted files", fg: CANARA_SAFFRON, attributes: TextAttributes.BOLD }),
-      ...(impacted.length > 0
-        ? impacted.slice(0, 24).map((file) => Text({ content: `  ${file}`, fg: MUTED }))
-        : [Text({ content: "  No impacted files were recorded for this scan.", fg: MUTED })])
-    )
-  )
 }
 
-function validateScreen(): any {
-  const scan = safeRead(() => getLatestScan(), null)
-
-  if (!scan) {
-    return emptyPanel(" Validate ", "Run a repository scan first, then run: bun run finsentry validate")
-  }
-
-  const validations = safeRead(() => getValidations(scan.id), [] as Validation[])
-  if (validations.length === 0) {
-    return emptyPanel(" Validate ", "No validation rows yet. Run: bun run finsentry validate")
-  }
-
-  const sat = validations.filter((v) => v.status === "satisfied").length
-  const miss = validations.filter((v) => v.status === "missing").length
-  const review = validations.filter((v) => v.status === "needs_review").length
-
-  return ScrollBox(
-    { borderStyle: "rounded", borderColor: CANARA_BLUE, padding: 1, flexGrow: 1 },
-    Box(
-      { flexDirection: "column", gap: 0 },
-      Text({ content: t`${fg(CANARA_SAFFRON)(bold(" Validate "))}` }),
-      Text({ content: ` Compliance score: ${complianceScore(validations)}% ${scoreBar(complianceScore(validations))}`, fg: scoreColor(complianceScore(validations)) }),
-      Text({ content: ` Satisfied: ${sat} | Missing: ${miss} | Needs review: ${review}`, fg: MUTED }),
-      Text({}),
-      ...validations.map((validation) => {
-        const badge = statusBadge(validation.status)
-        return Text({
-          content: ` ${badge.icon} MAP #${validation.map_id}: ${validation.status}${validation.details ? ` - ${trim(validation.details, 120)}` : ""}`,
-          fg: badge.color,
-        })
-      })
-    )
-  )
-}
-
-function aboutScreen(): any {
-  return Box(
-    { flexDirection: "column", borderStyle: "double", borderColor: CANARA_BLUE, padding: 1, gap: 0, flexGrow: 1 },
-    Text({ content: t`${fg(CANARA_SAFFRON)(bold(" CANARA BANK "))}` }),
-    Text({ content: "  ____                              ____              _", fg: CANARA_SAFFRON }),
-    Text({ content: " / ___|__ _ _ __   __ _ _ __ __ _  | __ )  __ _ _ __ | | __", fg: CANARA_SAFFRON }),
-    Text({ content: "| |   / _` | '_ \\ / _` | '__/ _` | |  _ \\ / _` | '_ \\| |/ /", fg: CANARA_SAFFRON }),
-    Text({ content: "| |__| (_| | | | | (_| | | | (_| | | |_) | (_| | | | |   <", fg: CANARA_SAFFRON }),
-    Text({ content: " \\____\\__,_|_| |_|\\__,_|_|  \\__,_| |____/ \\__,_|_| |_|_|\\_\\", fg: CANARA_SAFFRON }),
-    Text({}),
-    Text({ content: "FinSentry", fg: "#FFFFFF", attributes: TextAttributes.BOLD }),
-    Text({ content: "Local-first compliance intelligence for RBI mandates and engineering proof.", fg: "#DCE6F2" }),
-    Text({}),
-    Text({ content: "Team credits", fg: CANARA_SAFFRON, attributes: TextAttributes.BOLD }),
-    Text({ content: "  Shreyash  - Dashboard lead, main stats, requirements, Canara branding polish", fg: "#DCE6F2" }),
-    Text({ content: "  Debasmita - Regulations and scan surfaces", fg: MUTED }),
-    Text({ content: "  Archita   - Validate and about surfaces", fg: MUTED }),
-    Text({ content: "  Pranshu   - MCP server and RBI data pipeline", fg: MUTED }),
-    Text({}),
-    Text({ content: "Offline slash commands", fg: CANARA_SAFFRON, attributes: TextAttributes.BOLD }),
-    ...COMMANDS.map((command) => Text({ content: `  ${command.name.padEnd(10)} ${command.description}`, fg: "#DCE6F2" }))
-  )
-}
-
-function emptyPanel(title: string, message: string): any {
-  return Box(
-    { flexDirection: "column", borderStyle: "rounded", borderColor: CANARA_BLUE, padding: 1, gap: 1, flexGrow: 1 },
-    Text({ content: t`${fg(CANARA_SAFFRON)(bold(title))}` }),
-    Text({ content: ` ${message}`, fg: MUTED })
-  )
-}
-
-function metric(label: string, value: string, color: string): any {
-  return Text({
-    content: ` ${label.padEnd(18)} ${value}`,
-    fg: color,
-  })
-}
-
-function loadRegulations(): RegulationSummary[] {
-  const fromRegulations = safeRead(() => {
-    const db = getDb()
-    const table = db.query<{ name: string }, []>("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'regulations'").get()
-    if (!table) return []
-
-    return db
-      .query<any, []>(
-        "SELECT id, name, category, fetched_at, page_count FROM regulations ORDER BY category, id"
-      )
-      .all()
-      .map((row) => ({
-        id: String(row.id),
-        name: String(row.name),
-        category: String(row.category),
-        fetchedAt: String(row.fetched_at ?? ""),
-        pageCount: Number(row.page_count ?? 0),
-        source: "regulation" as const,
-      }))
-  }, [] as RegulationSummary[])
-
-  if (fromRegulations.length > 0) return fromRegulations
-
-  return safeRead(() => getDocuments(), [] as Document[]).map((doc) => ({
-    id: `DOC-${doc.id}`,
-    name: doc.filename,
-    category: doc.is_seeded ? "seeded" : "ingested",
-    fetchedAt: doc.ingested_at,
-    pageCount: 0,
-    source: "document" as const,
-  }))
-}
-
-function complianceScore(validations: Validation[]): number {
+function score(validations: Array<{ status: string }>): number {
   if (validations.length === 0) return 0
-  const satisfied = validations.filter((v) => v.status === "satisfied").length
-  return Math.round((satisfied / validations.length) * 100)
+  return Math.round((validations.filter((item) => item.status === "satisfied").length / validations.length) * 100)
 }
 
-function scoreBar(score: number): string {
-  const filled = Math.round(score / 10)
-  return `[${"#".repeat(filled)}${"-".repeat(10 - filled)}]`
+function logoResponse(): Response {
+  const logo = readFileSync(join(process.cwd(), "assets", "canara-bank-logo.png"))
+  return new Response(logo, { headers: { "Content-Type": "image/png" } })
 }
 
-function scoreColor(score: number): string {
-  if (score >= 80) return GOOD
-  if (score >= 50) return WARN
-  return BAD
+function html(body: string): Response {
+  return new Response(body, { headers: { "Content-Type": "text/html; charset=utf-8" } })
 }
 
-function statusBadge(status?: Validation["status"]): { icon: string; color: string } {
-  if (status === "satisfied") return { icon: "OK", color: GOOD }
-  if (status === "missing") return { icon: "NO", color: BAD }
-  if (status === "needs_review") return { icon: "??", color: WARN }
-  return { icon: "?", color: MUTED }
-}
-
-function formatScan(scan: Scan | null): string {
-  if (!scan) return "no scan yet"
-  return `${scan.repo_path} at ${formatDate(scan.scanned_at)}`
-}
-
-function formatDate(value: string): string {
-  if (!value) return "pending"
-  const date = new Date(value)
-  if (Number.isNaN(date.getTime())) return value
-  return date.toLocaleString()
-}
-
-function trim(value: string, max: number): string {
-  return value.length <= max ? value : `${value.slice(0, Math.max(0, max - 3))}...`
-}
-
-function unique(values: string[]): string[] {
-  return [...new Set(values)]
+function json(value: unknown): Response {
+  return Response.json(value)
 }
 
 function safeRead<T>(read: () => T, fallback: T): T {
@@ -487,4 +287,206 @@ function safeRead<T>(read: () => T, fallback: T): T {
   } catch {
     return fallback
   }
+}
+
+function baseHtml(title: string, content: string): string {
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>FinSentry - ${title}</title>
+  <style>
+    :root {
+      --blue: #003366;
+      --saffron: #ff9933;
+      --ink: #142033;
+      --muted: #617086;
+      --line: #d7dee8;
+      --panel: #ffffff;
+      --bg: #eef3f8;
+      --ok: #2e7d32;
+      --warn: #b86b00;
+      --bad: #c62828;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: Inter, "Segoe UI", Arial, sans-serif;
+      background: var(--bg);
+      color: var(--ink);
+      letter-spacing: 0;
+    }
+    button, input {
+      font: inherit;
+    }
+    button {
+      border: 0;
+      border-radius: 6px;
+      padding: 10px 14px;
+      color: #fff;
+      background: var(--blue);
+      cursor: pointer;
+      font-weight: 700;
+    }
+    button:hover { background: #004b91; }
+    .auth-shell {
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      padding: 28px;
+      background: linear-gradient(135deg, #e7f4fb 0%, #ffffff 52%, #fff0df 100%);
+    }
+    .login-panel {
+      width: min(430px, 100%);
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 32px;
+      box-shadow: 0 18px 50px rgba(0, 51, 102, .16);
+    }
+    .brand-logo {
+      width: 86px;
+      height: 86px;
+      object-fit: contain;
+      display: block;
+      margin-bottom: 18px;
+    }
+    .eyebrow {
+      margin: 0 0 6px;
+      color: var(--saffron);
+      font-size: 12px;
+      font-weight: 800;
+      text-transform: uppercase;
+    }
+    h1, h2, h3, p { margin-top: 0; }
+    h1 { margin-bottom: 8px; color: var(--blue); font-size: 34px; }
+    h2 { margin-bottom: 0; color: var(--blue); font-size: 26px; }
+    h3 { margin-bottom: 10px; color: var(--blue); font-size: 18px; }
+    .subtitle { color: var(--muted); line-height: 1.5; }
+    .login-form { display: grid; gap: 16px; margin-top: 24px; }
+    label { display: grid; gap: 7px; font-weight: 700; color: var(--blue); }
+    input {
+      min-height: 42px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 10px 12px;
+      color: var(--ink);
+      background: #fff;
+    }
+    .dashboard-shell {
+      min-height: 100vh;
+      display: grid;
+      grid-template-columns: 270px 1fr;
+    }
+    .sidebar {
+      background: var(--blue);
+      color: #fff;
+      padding: 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+    }
+    .side-logo {
+      width: 72px;
+      height: 72px;
+      object-fit: contain;
+      background: #0caee0;
+      border-radius: 6px;
+    }
+    .sidebar h1 { color: #fff; font-size: 28px; }
+    .user-card {
+      border: 1px solid rgba(255,255,255,.24);
+      border-radius: 8px;
+      padding: 14px;
+      display: grid;
+      gap: 4px;
+    }
+    .user-card small { color: #bfd3e8; }
+    nav { display: grid; gap: 10px; }
+    nav button {
+      background: rgba(255,255,255,.12);
+      text-align: left;
+      border: 1px solid rgba(255,255,255,.18);
+    }
+    .main-panel { padding: 26px; display: grid; gap: 20px; }
+    .topbar, .hero-grid, .metrics, .workbench {
+      display: grid;
+      gap: 16px;
+    }
+    .topbar {
+      grid-template-columns: 1fr auto;
+      align-items: center;
+    }
+    .status-pill {
+      border-radius: 999px;
+      padding: 9px 14px;
+      background: #e8f5e9;
+      color: var(--ok);
+      font-weight: 800;
+    }
+    .hero-grid { grid-template-columns: 1.25fr .85fr; }
+    article {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 20px;
+      box-shadow: 0 10px 24px rgba(20, 32, 51, .06);
+    }
+    .control-list { display: grid; gap: 10px; margin-top: 18px; }
+    .control-list div {
+      display: grid;
+      grid-template-columns: 88px 1fr auto;
+      gap: 10px;
+      align-items: center;
+      border-top: 1px solid var(--line);
+      padding-top: 10px;
+    }
+    .ok { color: var(--ok); }
+    .warn { color: var(--warn); }
+    .bad { color: var(--bad); }
+    .slash-row, .button-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin: 14px 0;
+    }
+    .command-card input { width: 100%; }
+    .metrics {
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+    }
+    .metrics article {
+      display: grid;
+      gap: 8px;
+      min-height: 96px;
+    }
+    .metrics span { color: var(--muted); font-weight: 700; }
+    .metrics strong { color: var(--blue); font-size: 28px; }
+    .workbench { grid-template-columns: 1fr 1fr; }
+    pre {
+      min-height: 190px;
+      white-space: pre-wrap;
+      margin: 0;
+      color: #dce8f5;
+      background: #101b2b;
+      border-radius: 6px;
+      padding: 14px;
+      line-height: 1.45;
+    }
+    @media (max-width: 980px) {
+      .dashboard-shell, .hero-grid, .workbench { grid-template-columns: 1fr; }
+      .sidebar { position: static; }
+      .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+    @media (max-width: 560px) {
+      .metrics { grid-template-columns: 1fr; }
+      .topbar { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+${content}
+</body>
+</html>`
 }
